@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#0A0A0D">
+    <title>Dictation Trainer</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-shell">
+        <header class="top-bar">
+            <div class="status-group">
+                <span id="statusDot" class="status-dot status-paused" aria-hidden="true"></span>
+                <span id="statusText" class="status-text">Пауза</span>
+            </div>
+
+            <div class="controls-group">
+                <div class="lang-toggle" role="group" aria-label="Мова розпізнавання">
+                    <button id="langEnBtn" class="lang-btn active" type="button">EN</button>
+                    <button id="langUkBtn" class="lang-btn" type="button">UK</button>
+                </div>
+
+                <label class="switch-label" for="listenToggle">
+                    <span>Слухати</span>
+                    <input type="checkbox" id="listenToggle">
+                    <span class="switch-track">
+                        <span class="switch-thumb"></span>
+                    </span>
+                </label>
+
+                <button id="openEditorBtn" class="btn-outline" type="button">Словник</button>
+            </div>
+        </header>
+
+        <main class="center-stage">
+            <div id="translationText" class="translation-text">Очікування слова…</div>
+            <div id="originalText" class="original-text"></div>
+        </main>
+    </div>
+
+    <!-- Word List Editor Modal -->
+    <div id="editorModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="editorTitle">
+        <div class="modal-panel">
+            <div class="modal-header">
+                <h2 id="editorTitle">Список слів</h2>
+                <span id="parsedCount" class="parsed-count">Розпізнано пар: 0</span>
+            </div>
+            <p class="modal-hint">Формат: слово - переклад (або —), кожна пара з нового рядка</p>
+            <textarea id="wordListInput" class="word-textarea" spellcheck="false" placeholder="kitchen - Кухня&#10;window - Вікно"></textarea>
+            <div class="modal-actions">
+                <button id="pasteBtn" class="btn-outline" type="button">Вставити</button>
+                <button id="cancelEditorBtn" class="btn-outline" type="button">Скасувати</button>
+                <button id="saveWordsBtn" class="btn-primary" type="button">Зберегти</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
