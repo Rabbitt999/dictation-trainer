@@ -144,37 +144,23 @@
     }
 
     function wordsMatch(spokenWord, dictWord, isUkrainian) {
-        if (spokenWord === dictWord) return true;
-        if (dictWord.length < 3 || spokenWord.length < 3) return false;
+        if (spokenWord === dictWord) return 2; // Exact match (highest priority)
+        if (dictWord.length < 4 || spokenWord.length < 4) return 0;
+        if (Math.abs(spokenWord.length - dictWord.length) > 2) return 0;
 
         if (!isUkrainian) {
-            // Simple English plural / -ed / -ing tolerance for words >= 4 chars
-            if (dictWord.length >= 4 && Math.abs(spokenWord.length - dictWord.length) <= 2) {
-                const minLen = Math.min(spokenWord.length, dictWord.length);
-                if (spokenWord.slice(0, minLen) === dictWord.slice(0, minLen)) {
-                    return true;
-                }
-            }
-            return false;
+            const maxDist = dictWord.length <= 5 ? 1 : 2;
+            return levenshtein(spokenWord, dictWord) <= maxDist ? 1 : 0;
         }
 
-        // Ukrainian inflection / case matching
+        // Ukrainian inflection / case & indistinct-speech matching
         const sNorm = normalizeUkStem(spokenWord);
         const dNorm = normalizeUkStem(dictWord);
-        if (sNorm === dNorm) return true;
+        if (sNorm === dNorm) return 2;
 
         const minLen = Math.min(sNorm.length, dNorm.length);
-        const requiredPrefix = minLen <= 4 ? 3 : Math.floor(minLen * 0.65);
-
-        let commonPrefix = 0;
-        while (commonPrefix < minLen && sNorm[commonPrefix] === dNorm[commonPrefix]) {
-            commonPrefix++;
-        }
-
-        if (commonPrefix < requiredPrefix) return false;
-
         const maxDist = minLen <= 5 ? 1 : 2;
-        return levenshtein(sNorm, dNorm) <= maxDist;
+        return levenshtein(sNorm, dNorm) <= maxDist ? 1 : 0;
     }
 
     function buildLookupIndex(pairs) {
@@ -200,13 +186,14 @@
             }
         }
 
-        // Search transcript in context (handles multi-word phrases & single words, picks rightmost match)
+        // Search transcript in context (handles multi-word phrases & single words, picks rightmost & exactest match)
         function findBestMatchInContext(transcript, entries, isUkrainian) {
             const cleaned = normalizeForMatch(transcript);
             if (!cleaned) return null;
 
             const spokenTokens = cleaned.split(" ");
             let bestEndIdx = -1;
+            let bestScore = 0;
             let bestLength = 0;
             let bestPair = null;
 
@@ -215,18 +202,26 @@
                 if (phraseLen > spokenTokens.length) continue;
 
                 for (let start = 0; start <= spokenTokens.length - phraseLen; start++) {
+                    let minWordScore = 2;
                     let allMatched = true;
                     for (let offset = 0; offset < phraseLen; offset++) {
-                        if (!wordsMatch(spokenTokens[start + offset], entry.tokens[offset], isUkrainian)) {
+                        const score = wordsMatch(spokenTokens[start + offset], entry.tokens[offset], isUkrainian);
+                        if (score === 0) {
                             allMatched = false;
                             break;
                         }
+                        if (score < minWordScore) minWordScore = score;
                     }
 
                     if (allMatched) {
                         const endIdx = start + phraseLen - 1;
-                        if (endIdx > bestEndIdx || (endIdx === bestEndIdx && phraseLen > bestLength)) {
+                        const isBetter =
+                            endIdx > bestEndIdx ||
+                            (endIdx === bestEndIdx && minWordScore > bestScore) ||
+                            (endIdx === bestEndIdx && minWordScore === bestScore && phraseLen > bestLength);
+                        if (isBetter) {
                             bestEndIdx = endIdx;
+                            bestScore = minWordScore;
                             bestLength = phraseLen;
                             bestPair = entry.pair;
                         }
@@ -361,7 +356,7 @@
         rec.lang = activeLang;
         rec.continuous = true;
         rec.interimResults = true;
-        rec.maxAlternatives = 5;
+        rec.maxAlternatives = 10;
 
         rec.onstart = () => {
             if (isListening) {
@@ -448,7 +443,10 @@
         localStorage.setItem(LANG_STORAGE_KEY, activeLang);
         updateLangButtons();
         if (isListening) {
-            spawnRecognition();
+            cleanupRecognitionInstance();
+            restartTimer = setTimeout(() => {
+                if (isListening) spawnRecognition();
+            }, 250);
         }
     }
 
@@ -506,10 +504,20 @@
     });
 
     saveWordsBtn.addEventListener("click", () => {
-        saveRawWords(wordListInput.value);
+        const updatedPairs = saveRawWords(wordListInput.value);
         editorModal.classList.add("hidden");
         if (isListening) {
-            startListening();
+            if (updatedPairs.length === 0) {
+                listenToggle.checked = false;
+                stopListening();
+                refreshIdleSubtitle();
+                return;
+            }
+            // Update lookup index live without interrupting the active microphone
+            currentIndex = buildLookupIndex(updatedPairs);
+            if (!recognition) {
+                spawnRecognition();
+            }
         } else {
             refreshIdleSubtitle();
         }
