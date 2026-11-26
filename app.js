@@ -1,6 +1,8 @@
 (() => {
     const STORAGE_KEY = "dictation_trainer_raw_words_v1";
     const LANG_STORAGE_KEY = "dictation_trainer_lang_v1";
+    const MAX_HISTORY_ITEMS = 3;
+    const MAX_INPUT_CHARS = 200000;
     const SAMPLE_WORDS = [
         "kitchen - Кухня",
         "window - Вікно",
@@ -20,6 +22,8 @@
     const langUkBtn = document.getElementById("langUkBtn");
     const listenToggle = document.getElementById("listenToggle");
     const openEditorBtn = document.getElementById("openEditorBtn");
+    const historyList = document.getElementById("historyList");
+    const currentWordBox = document.getElementById("currentWordBox");
     const translationText = document.getElementById("translationText");
     const originalText = document.getElementById("originalText");
 
@@ -32,9 +36,11 @@
 
     let activeLang = localStorage.getItem(LANG_STORAGE_KEY) === "uk-UA" ? "uk-UA" : "en-US";
     let recognition = null;
+    let restartTimer = null;
     let isListening = false;
     let wakeLock = null;
-    let lastDisplayKey = "";
+    let currentDisplay = null;
+    let historyItems = [];
     let currentIndex = null;
 
     function setStatus(state, message) {
@@ -54,31 +60,40 @@
     function normalizeForMatch(text) {
         return text
             .toLowerCase()
-            .replace(/[.,!?;:"'()\[\]]/g, "")
+            .replace(/['’`]/g, "")
+            .replace(/ґ/g, "г")
+            .replace(/[.,!?;:"()\[\]—–-]/g, " ")
             .replace(/\s+/g, " ")
             .trim();
     }
 
+    // Safe O(n) parser without backtracking regexes
     function parseWordList(rawText) {
+        const safeText = rawText.slice(0, MAX_INPUT_CHARS);
         const pairs = [];
-        const lines = rawText.split(/\r?\n/);
+        const lines = safeText.split(/\r?\n/);
 
         for (const rawLine of lines) {
             const line = rawLine.trim();
             if (!line) continue;
 
-            let parts;
-            if (/\s+[—–-]\s+/.test(line)) {
-                const match = line.match(/^([\s\S]+?)\s+[—–-]\s+([\s\S]+)$/);
-                parts = match ? [match[1], match[2]] : [];
+            let splitIdx = line.search(/\s+[—–-]\s+/);
+            let left = "";
+            let right = "";
+
+            if (splitIdx !== -1) {
+                left = line.slice(0, splitIdx);
+                const rest = line.slice(splitIdx).replace(/^\s+[—–-]\s+/, "");
+                right = rest;
             } else {
-                const idx = line.search(/[—–-]/);
-                parts = idx > 0 ? [line.slice(0, idx), line.slice(idx + 1)] : [];
+                const dashIdx = line.search(/[—–-]/);
+                if (dashIdx <= 0) continue;
+                left = line.slice(0, dashIdx);
+                right = line.slice(dashIdx + 1);
             }
 
-            if (parts.length < 2) continue;
-            const left = cleanDisplay(parts[0]);
-            const right = cleanDisplay(parts[1]);
+            left = cleanDisplay(left);
+            right = cleanDisplay(right);
             if (!left || !right) continue;
 
             const leftIsCyrillic = /[\u0400-\u04FF]/.test(left);
@@ -93,36 +108,142 @@
         return pairs;
     }
 
-    function buildLookupIndex(pairs) {
-        const enMap = new Map();
-        const ukMap = new Map();
+    // Levenshtein distance with early exit
+    function levenshtein(a, b) {
+        if (a === b) return 0;
+        const m = a.length;
+        const n = b.length;
+        if (m === 0) return n;
+        if (n === 0) return m;
 
-        for (const pair of pairs) {
-            const enKey = normalizeForMatch(pair.english);
-            const ukKey = normalizeForMatch(pair.ukrainian);
-            if (enKey && !enMap.has(enKey)) enMap.set(enKey, pair);
-            if (ukKey && !ukMap.has(ukKey)) ukMap.set(ukKey, pair);
+        const dp = new Array(n + 1);
+        for (let j = 0; j <= n; j++) dp[j] = j;
+
+        for (let i = 1; i <= m; i++) {
+            let prev = dp[0];
+            dp[0] = i;
+            for (let j = 1; j <= n; j++) {
+                const temp = dp[j];
+                if (a[i - 1] === b[j - 1]) {
+                    dp[j] = prev;
+                } else {
+                    dp[j] = 1 + Math.min(prev, dp[j], dp[j - 1]);
+                }
+                prev = temp;
+            }
+        }
+        return dp[n];
+    }
+
+    // Handles Ukrainian case endings (відмінки) & consonant alternations (г/з, к/ц, х/с)
+    function normalizeUkStem(word) {
+        return word
+            .replace(/ці$/, "к")
+            .replace(/зі$/, "г")
+            .replace(/сі$/, "х");
+    }
+
+    function wordsMatch(spokenWord, dictWord, isUkrainian) {
+        if (spokenWord === dictWord) return true;
+        if (dictWord.length < 3 || spokenWord.length < 3) return false;
+
+        if (!isUkrainian) {
+            // Simple English plural / -ed / -ing tolerance for words >= 4 chars
+            if (dictWord.length >= 4 && Math.abs(spokenWord.length - dictWord.length) <= 2) {
+                const minLen = Math.min(spokenWord.length, dictWord.length);
+                if (spokenWord.slice(0, minLen) === dictWord.slice(0, minLen)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
-        function findInMap(rawRecognized, map) {
-            const cleaned = normalizeForMatch(rawRecognized);
-            if (!cleaned) return null;
-            if (map.has(cleaned)) return map.get(cleaned);
+        // Ukrainian inflection / case matching
+        const sNorm = normalizeUkStem(spokenWord);
+        const dNorm = normalizeUkStem(dictWord);
+        if (sNorm === dNorm) return true;
 
-            const tokens = cleaned.split(" ");
-            for (let i = tokens.length - 1; i >= 0; i--) {
-                if (map.has(tokens[i])) return map.get(tokens[i]);
+        const minLen = Math.min(sNorm.length, dNorm.length);
+        const requiredPrefix = minLen <= 4 ? 3 : Math.floor(minLen * 0.65);
+
+        let commonPrefix = 0;
+        while (commonPrefix < minLen && sNorm[commonPrefix] === dNorm[commonPrefix]) {
+            commonPrefix++;
+        }
+
+        if (commonPrefix < requiredPrefix) return false;
+
+        const maxDist = minLen <= 5 ? 1 : 2;
+        return levenshtein(sNorm, dNorm) <= maxDist;
+    }
+
+    function buildLookupIndex(pairs) {
+        const enEntries = [];
+        const ukEntries = [];
+
+        for (const pair of pairs) {
+            const enNorm = normalizeForMatch(pair.english);
+            const ukNorm = normalizeForMatch(pair.ukrainian);
+            if (enNorm) {
+                enEntries.push({
+                    norm: enNorm,
+                    tokens: enNorm.split(" "),
+                    pair
+                });
             }
-            return null;
+            if (ukNorm) {
+                ukEntries.push({
+                    norm: ukNorm,
+                    tokens: ukNorm.split(" "),
+                    pair
+                });
+            }
+        }
+
+        // Search transcript in context (handles multi-word phrases & single words, picks rightmost match)
+        function findBestMatchInContext(transcript, entries, isUkrainian) {
+            const cleaned = normalizeForMatch(transcript);
+            if (!cleaned) return null;
+
+            const spokenTokens = cleaned.split(" ");
+            let bestEndIdx = -1;
+            let bestLength = 0;
+            let bestPair = null;
+
+            for (const entry of entries) {
+                const phraseLen = entry.tokens.length;
+                if (phraseLen > spokenTokens.length) continue;
+
+                for (let start = 0; start <= spokenTokens.length - phraseLen; start++) {
+                    let allMatched = true;
+                    for (let offset = 0; offset < phraseLen; offset++) {
+                        if (!wordsMatch(spokenTokens[start + offset], entry.tokens[offset], isUkrainian)) {
+                            allMatched = false;
+                            break;
+                        }
+                    }
+
+                    if (allMatched) {
+                        const endIdx = start + phraseLen - 1;
+                        if (endIdx > bestEndIdx || (endIdx === bestEndIdx && phraseLen > bestLength)) {
+                            bestEndIdx = endIdx;
+                            bestLength = phraseLen;
+                            bestPair = entry.pair;
+                        }
+                    }
+                }
+            }
+
+            return bestPair;
         }
 
         return {
             matchByActiveLang(transcript, lang) {
                 if (lang === "uk-UA") {
-                    const pair = findInMap(transcript, ukMap);
+                    const pair = findBestMatchInContext(transcript, ukEntries, true);
                     return pair ? { translation: pair.english, spokenOriginal: pair.ukrainian } : null;
                 }
-                const pair = findInMap(transcript, enMap);
+                const pair = findBestMatchInContext(transcript, enEntries, false);
                 return pair ? { translation: pair.ukrainian, spokenOriginal: pair.english } : null;
             }
         };
@@ -133,33 +254,78 @@
     }
 
     function saveRawWords(rawText) {
-        localStorage.setItem(STORAGE_KEY, rawText);
-        return parseWordList(rawText);
+        const safeText = rawText.slice(0, MAX_INPUT_CHARS);
+        try {
+            localStorage.setItem(STORAGE_KEY, safeText);
+        } catch (err) {
+            alert("Не вдалося зберегти: занадто великий список.");
+        }
+        return parseWordList(safeText);
     }
 
     function refreshIdleSubtitle() {
-        if (!originalText.textContent || translationText.textContent === "Очікування слова…") {
+        if (!currentDisplay) {
             const count = parseWordList(getRawWords()).length;
             translationText.textContent = "Очікування слова…";
             originalText.textContent = `(${count} слів у словнику)`;
         }
     }
 
+    function renderHistory() {
+        // Strictly use textContent (no innerHTML) to prevent XSS
+        historyList.replaceChildren();
+        const total = historyItems.length;
+        historyItems.forEach((item, idx) => {
+            const age = total - idx; // 1 = most recent previous, 2 = older, 3 = oldest
+            const row = document.createElement("div");
+            row.className = "history-item";
+            row.dataset.age = String(age);
+
+            const tr = document.createElement("div");
+            tr.className = "history-translation";
+            tr.textContent = item.translation;
+
+            const orig = document.createElement("div");
+            orig.className = "history-original";
+            orig.textContent = `(${item.spokenOriginal})`;
+
+            row.appendChild(tr);
+            row.appendChild(orig);
+            historyList.appendChild(row);
+        });
+    }
+
     function displayRecognizedWord(display) {
-        const key = `${display.translation}|${display.spokenOriginal}`;
-        if (key === lastDisplayKey) return;
-        lastDisplayKey = key;
+        if (
+            currentDisplay &&
+            currentDisplay.translation === display.translation &&
+            currentDisplay.spokenOriginal === display.spokenOriginal
+        ) {
+            return;
+        }
+
+        if (currentDisplay) {
+            historyItems.push(currentDisplay);
+            if (historyItems.length > MAX_HISTORY_ITEMS) {
+                historyItems.shift();
+            }
+            renderHistory();
+        }
+
+        currentDisplay = display;
         translationText.textContent = display.translation;
         originalText.textContent = `(${display.spokenOriginal})`;
+
+        currentWordBox.classList.remove("word-enter");
+        void currentWordBox.offsetWidth;
+        currentWordBox.classList.add("word-enter");
     }
 
     async function requestWakeLock() {
         if (!("wakeLock" in navigator)) return;
         try {
             wakeLock = await navigator.wakeLock.request("screen");
-        } catch (err) {
-            console.warn("WakeLock unavailable:", err);
-        }
+        } catch (_) {}
     }
 
     async function releaseWakeLock() {
@@ -169,22 +335,27 @@
         }
     }
 
-    function startListening() {
-        if (!SpeechRecognition) {
-            listenToggle.checked = false;
-            setStatus("error", "Браузер не підтримує Web Speech API (використайте Chrome)");
-            return;
+    function cleanupRecognitionInstance() {
+        if (restartTimer) {
+            clearTimeout(restartTimer);
+            restartTimer = null;
         }
-
-        const pairs = parseWordList(getRawWords());
-        if (pairs.length === 0) {
-            listenToggle.checked = false;
-            alert("Список слів порожній. Додайте хоча б одну пару слів.");
-            return;
+        if (recognition) {
+            const old = recognition;
+            recognition = null;
+            old.onstart = null;
+            old.onresult = null;
+            old.onerror = null;
+            old.onend = null;
+            try { old.stop(); } catch (_) {}
         }
+    }
 
-        currentIndex = buildLookupIndex(pairs);
-        isListening = true;
+    // Creates a fresh SpeechRecognition instance each time (critical for iOS Safari auto-restart)
+    function spawnRecognition() {
+        if (!isListening || !SpeechRecognition) return;
+
+        cleanupRecognitionInstance();
 
         const rec = new SpeechRecognition();
         rec.lang = activeLang;
@@ -218,47 +389,55 @@
             if (event.error === "not-allowed" || event.error === "service-not-allowed") {
                 isListening = false;
                 listenToggle.checked = false;
+                cleanupRecognitionInstance();
                 releaseWakeLock();
                 setStatus("error", "Доступ до мікрофона заборонено");
-            } else if (event.error !== "no-speech" && event.error !== "aborted") {
-                console.warn("SpeechRecognition error:", event.error);
             }
+            // For "no-speech", "aborted", "network" on iOS/Android, onend handles clean restart
         };
 
         rec.onend = () => {
-            if (isListening) {
-                // Auto-restart continuous listening seamlessly
-                try {
-                    rec.start();
-                } catch (_) {
-                    setTimeout(() => {
-                        if (isListening) {
-                            try { rec.start(); } catch (_) {}
-                        }
-                    }, 200);
+            if (!isListening) return;
+            restartTimer = setTimeout(() => {
+                if (isListening) {
+                    spawnRecognition();
                 }
-            }
+            }, 180);
         };
 
         recognition = rec;
         try {
             rec.start();
-            requestWakeLock();
-        } catch (err) {
-            isListening = false;
-            listenToggle.checked = false;
-            setStatus("error", err.message || "Не вдалося запустити мікрофон");
+        } catch (_) {
+            restartTimer = setTimeout(() => {
+                if (isListening) spawnRecognition();
+            }, 300);
         }
+    }
+
+    function startListening() {
+        if (!SpeechRecognition) {
+            listenToggle.checked = false;
+            setStatus("error", "Браузер не підтримує розпізнавання мовлення");
+            return;
+        }
+
+        const pairs = parseWordList(getRawWords());
+        if (pairs.length === 0) {
+            listenToggle.checked = false;
+            alert("Список слів порожній. Додайте хоча б одну пару слів.");
+            return;
+        }
+
+        currentIndex = buildLookupIndex(pairs);
+        isListening = true;
+        requestWakeLock();
+        spawnRecognition();
     }
 
     function stopListening() {
         isListening = false;
-        if (recognition) {
-            const rec = recognition;
-            recognition = null;
-            rec.onend = null;
-            try { rec.stop(); } catch (_) {}
-        }
+        cleanupRecognitionInstance();
         releaseWakeLock();
         setStatus("paused", "Пауза");
     }
@@ -269,8 +448,7 @@
         localStorage.setItem(LANG_STORAGE_KEY, activeLang);
         updateLangButtons();
         if (isListening) {
-            stopListening();
-            startListening();
+            spawnRecognition();
         }
     }
 
@@ -288,6 +466,7 @@
     document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible" && isListening) {
             requestWakeLock();
+            if (!recognition) spawnRecognition();
         }
     });
 
@@ -315,8 +494,8 @@
                 alert("Буфер обміну порожній");
                 return;
             }
-            wordListInput.value = clipText;
-            updateParsedCount(clipText);
+            wordListInput.value = clipText.slice(0, MAX_INPUT_CHARS);
+            updateParsedCount(wordListInput.value);
         } catch (_) {
             alert("Надайте дозвіл на читання буфера обміну або вставте текст вручну.");
         }
@@ -330,7 +509,6 @@
         saveRawWords(wordListInput.value);
         editorModal.classList.add("hidden");
         if (isListening) {
-            stopListening();
             startListening();
         } else {
             refreshIdleSubtitle();

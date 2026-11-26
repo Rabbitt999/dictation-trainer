@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="theme-color" content="#0A0A0D">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self';">
     <title>Dictation Trainer</title>
     <link rel="stylesheet" href="styles.css">
 </head>
@@ -34,8 +35,12 @@
         </header>
 
         <main class="center-stage">
-            <div id="translationText" class="translation-text">Очікування слова…</div>
-            <div id="originalText" class="original-text"></div>
+            <div id="historyList" class="history-list" aria-live="off"></div>
+
+            <div id="currentWordBox" class="current-word-box">
+                <div id="translationText" class="translation-text">Очікування слова…</div>
+                <div id="originalText" class="original-text"></div>
+            </div>
         </main>
     </div>
 
@@ -47,7 +52,7 @@
                 <span id="parsedCount" class="parsed-count">Розпізнано пар: 0</span>
             </div>
             <p class="modal-hint">Формат: слово - переклад (або —), кожна пара з нового рядка</p>
-            <textarea id="wordListInput" class="word-textarea" spellcheck="false" placeholder="kitchen - Кухня&#10;window - Вікно"></textarea>
+            <textarea id="wordListInput" class="word-textarea" spellcheck="false" maxlength="200000" placeholder="kitchen - Кухня&#10;window - Вікно"></textarea>
             <div class="modal-actions">
                 <button id="pasteBtn" class="btn-outline" type="button">Вставити</button>
                 <button id="cancelEditorBtn" class="btn-outline" type="button">Скасувати</button>
