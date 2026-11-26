@@ -143,24 +143,84 @@
             .replace(/сі$/, "х");
     }
 
-    function wordsMatch(spokenWord, dictWord, isUkrainian) {
-        if (spokenWord === dictWord) return 2; // Exact match (highest priority)
-        if (dictWord.length < 4 || spokenWord.length < 4) return 0;
-        if (Math.abs(spokenWord.length - dictWord.length) > 2) return 0;
+    function ukPhoneticKey(word) {
+        return normalizeUkStem(word)
+            .replace(/(.)\1+/g, "$1")
+            .replace(/[иіїй]/g, "і")
+            .replace(/[еє]/g, "е")
+            .replace(/ґ/g, "г")
+            .replace(/щ/g, "ш")
+            .replace(/дз/g, "з")
+            .replace(/дж/g, "ж")
+            .replace(/п/g, "б")
+            .replace(/т/g, "д")
+            .replace(/ф/g, "в")
+            .replace(/с/g, "з")
+            .replace(/ш/g, "ж")
+            .replace(/к/g, "г");
+    }
 
-        if (!isUkrainian) {
-            const maxDist = dictWord.length <= 5 ? 1 : 2;
-            return levenshtein(spokenWord, dictWord) <= maxDist ? 1 : 0;
+    function enPhoneticKey(word) {
+        let res = word
+            .replace(/(.)\1+/g, "$1")
+            .replace(/ph/g, "f")
+            .replace(/ck/g, "k")
+            .replace(/qu/g, "k")
+            .replace(/c(?=[eiy])/g, "s")
+            .replace(/c/g, "k")
+            .replace(/kn/g, "n")
+            .replace(/wr/g, "r")
+            .replace(/wh/g, "w")
+            .replace(/w/g, "v")
+            .replace(/gh/g, "")
+            .replace(/ee|ea|ie/g, "i")
+            .replace(/oo|ou/g, "u")
+            .replace(/ae|ai|ay/g, "e");
+        if (res.length > 3 && res.endsWith("e")) {
+            res = res.slice(0, -1);
+        }
+        return res;
+    }
+
+    function wordsMatch(spokenWord, dictWord, isUkrainian) {
+        if (spokenWord === dictWord) return 3; // Exact match (highest priority)
+        if (dictWord.length < 3 || spokenWord.length < 3) return 0;
+
+        if (isUkrainian) {
+            const sNorm = normalizeUkStem(spokenWord);
+            const dNorm = normalizeUkStem(dictWord);
+            if (sNorm === dNorm) return 2;
+
+            if (dictWord.length >= 4 && spokenWord.length >= 4) {
+                const sPhon = ukPhoneticKey(spokenWord);
+                const dPhon = ukPhoneticKey(dictWord);
+                if (sPhon === dPhon) return 2;
+
+                if (Math.abs(sNorm.length - dNorm.length) <= 2) {
+                    const maxDist = Math.min(sNorm.length, dNorm.length) <= 5 ? 1 : 2;
+                    if (levenshtein(sNorm, dNorm) <= maxDist) return 1;
+                    if (Math.min(sPhon.length, dPhon.length) >= 5 && levenshtein(sPhon, dPhon) <= 1) return 1;
+                }
+            }
+            return 0;
         }
 
-        // Ukrainian inflection / case & indistinct-speech matching
-        const sNorm = normalizeUkStem(spokenWord);
-        const dNorm = normalizeUkStem(dictWord);
-        if (sNorm === dNorm) return 2;
+        // English: phonetic + fuzzy matching for words >= 4 chars
+        if (dictWord.length >= 4 && spokenWord.length >= 4) {
+            if (enPhoneticKey(spokenWord) === enPhoneticKey(dictWord)) return 2;
+            if (Math.abs(spokenWord.length - dictWord.length) <= 2) {
+                const maxDist = dictWord.length <= 5 ? 1 : 2;
+                if (levenshtein(spokenWord, dictWord) <= maxDist) return 1;
+            }
+        }
+        return 0;
+    }
 
-        const minLen = Math.min(sNorm.length, dNorm.length);
-        const maxDist = minLen <= 5 ? 1 : 2;
-        return levenshtein(sNorm, dNorm) <= maxDist ? 1 : 0;
+    function splitVariants(text) {
+        return text
+            .split(/[,/]/)
+            .map(v => normalizeForMatch(v))
+            .filter(Boolean);
     }
 
     function buildLookupIndex(pairs) {
@@ -168,25 +228,23 @@
         const ukEntries = [];
 
         for (const pair of pairs) {
-            const enNorm = normalizeForMatch(pair.english);
-            const ukNorm = normalizeForMatch(pair.ukrainian);
-            if (enNorm) {
+            for (const enNorm of splitVariants(pair.english)) {
                 enEntries.push({
-                    norm: enNorm,
+                    joined: enNorm.replace(/\s+/g, ""),
                     tokens: enNorm.split(" "),
                     pair
                 });
             }
-            if (ukNorm) {
+            for (const ukNorm of splitVariants(pair.ukrainian)) {
                 ukEntries.push({
-                    norm: ukNorm,
+                    joined: ukNorm.replace(/\s+/g, ""),
                     tokens: ukNorm.split(" "),
                     pair
                 });
             }
         }
 
-        // Search transcript in context (handles multi-word phrases & single words, picks rightmost & exactest match)
+        // Search transcript in context (handles multi-word phrases, split/joined words, & picks rightmost/exactest match)
         function findBestMatchInContext(transcript, entries, isUkrainian) {
             const cleaned = normalizeForMatch(transcript);
             if (!cleaned) return null;
@@ -197,33 +255,58 @@
             let bestLength = 0;
             let bestPair = null;
 
+            const considerCandidate = (endIdx, score, length, pair) => {
+                const isBetter =
+                    endIdx > bestEndIdx ||
+                    (endIdx === bestEndIdx && score > bestScore) ||
+                    (endIdx === bestEndIdx && score === bestScore && length > bestLength);
+                if (isBetter) {
+                    bestEndIdx = endIdx;
+                    bestScore = score;
+                    bestLength = length;
+                    bestPair = pair;
+                }
+            };
+
             for (const entry of entries) {
                 const phraseLen = entry.tokens.length;
-                if (phraseLen > spokenTokens.length) continue;
 
-                for (let start = 0; start <= spokenTokens.length - phraseLen; start++) {
-                    let minWordScore = 2;
-                    let allMatched = true;
-                    for (let offset = 0; offset < phraseLen; offset++) {
-                        const score = wordsMatch(spokenTokens[start + offset], entry.tokens[offset], isUkrainian);
-                        if (score === 0) {
-                            allMatched = false;
-                            break;
+                // 1. Standard token sequence match
+                if (phraseLen <= spokenTokens.length) {
+                    for (let start = 0; start <= spokenTokens.length - phraseLen; start++) {
+                        let minWordScore = 3;
+                        let allMatched = true;
+                        for (let offset = 0; offset < phraseLen; offset++) {
+                            const score = wordsMatch(spokenTokens[start + offset], entry.tokens[offset], isUkrainian);
+                            if (score === 0) {
+                                allMatched = false;
+                                break;
+                            }
+                            if (score < minWordScore) minWordScore = score;
                         }
-                        if (score < minWordScore) minWordScore = score;
+                        if (allMatched) {
+                            considerCandidate(start + phraseLen - 1, minWordScore, phraseLen, entry.pair);
+                        }
                     }
+                }
 
-                    if (allMatched) {
-                        const endIdx = start + phraseLen - 1;
-                        const isBetter =
-                            endIdx > bestEndIdx ||
-                            (endIdx === bestEndIdx && minWordScore > bestScore) ||
-                            (endIdx === bestEndIdx && minWordScore === bestScore && phraseLen > bestLength);
-                        if (isBetter) {
-                            bestEndIdx = endIdx;
-                            bestScore = minWordScore;
-                            bestLength = phraseLen;
-                            bestPair = entry.pair;
+                // 2. Split compound word match: dict "sunlight" vs spoken "sun light"
+                if (phraseLen === 1 && spokenTokens.length >= 2) {
+                    for (let start = 0; start < spokenTokens.length - 1; start++) {
+                        const merged = spokenTokens[start] + spokenTokens[start + 1];
+                        const score = wordsMatch(merged, entry.joined, isUkrainian);
+                        if (score > 0) {
+                            considerCandidate(start + 1, score, 2, entry.pair);
+                        }
+                    }
+                }
+
+                // 3. Joined compound word match: dict "ice cream" vs spoken "icecream"
+                if (phraseLen === 2) {
+                    for (let i = 0; i < spokenTokens.length; i++) {
+                        const score = wordsMatch(spokenTokens[i], entry.joined, isUkrainian);
+                        if (score > 0) {
+                            considerCandidate(i, score, 1, entry.pair);
                         }
                     }
                 }
@@ -397,7 +480,7 @@
                 if (isListening) {
                     spawnRecognition();
                 }
-            }, 180);
+            }, 60);
         };
 
         recognition = rec;
